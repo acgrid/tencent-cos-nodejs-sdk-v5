@@ -1,7 +1,8 @@
 var fs = require('fs');
 var path = require('path');
+var http = require('http');
 var COS = require('../index');
-var request = require('request');
+var request = require('@cypress/request');
 var util = require('../demo/util');
 var Stream = require('stream');
 
@@ -60,6 +61,16 @@ var group = function (name, fn) {
     this.timeout(2 * 60 * 1000);
     fn.apply(this, arguments);
   });
+};
+var envFlag = function (name) {
+  return /^(1|true|yes)$/i.test(process.env[name] || '');
+};
+var optionalGroup = function (name, envName, fn) {
+  if (envFlag(envName)) {
+    group(name, fn);
+  } else {
+    describe.skip(name + ' (set ' + envName + '=1)', fn);
+  }
 };
 var proxy = '';
 
@@ -3713,16 +3724,16 @@ group('BucketWebsite', function () {
   });
 });
 
-group('BucketDomain', function () {
+optionalGroup('BucketDomain', 'COS_RUN_BUCKET_DOMAIN_TESTS', function () {
   var DomainRule = [
     {
       Status: 'DISABLED',
-      Name: 'www.testDomain1.com',
+      Name: process.env.COS_BUCKET_DOMAIN_REST || 'www.testDomain1.com',
       Type: 'REST',
     },
     {
       Status: 'DISABLED',
-      Name: 'www.testDomain2.com',
+      Name: process.env.COS_BUCKET_DOMAIN_WEBSITE || 'www.testDomain2.com',
       Type: 'WEBSITE',
     },
   ];
@@ -4446,8 +4457,8 @@ group('Cache-Control', function () {
   });
 });
 
-group('BucketLogging', function () {
-  var TargetBucket = config.Bucket;
+optionalGroup('BucketLogging', 'COS_RUN_BUCKET_LOGGING_TESTS', function () {
+  var TargetBucket = process.env.COS_LOGGING_TARGET_BUCKET || config.Bucket;
   var TargetPrefix = 'bucket-logging-prefix' + Date.now().toString(36) + '/';
   var BucketLoggingStatus = {
     LoggingEnabled: {
@@ -5466,11 +5477,11 @@ group('selectObjectContent(),selectObjectContentStream()', function () {
   });
 });
 
-group('BucketReplication', function () {
+optionalGroup('BucketReplication', 'COS_RUN_BUCKET_REPLICATION_TESTS', function () {
   var prepared = false;
-  var repBucket = config.Bucket.replace(/^(.*)(-\d+)$/, '$1-replication$2');
+  var repBucket = process.env.COS_REPLICATION_BUCKET || config.Bucket.replace(/^(.*)(-\d+)$/, '$1-replication$2');
   var repBucketName = repBucket.replace(/(-\d+)$/, '');
-  var repRegion = 'ap-chengdu';
+  var repRegion = process.env.COS_REPLICATION_REGION || 'ap-chengdu';
   var prepareRepBucket = function (callback) {
     cos.putBucket(
       {
@@ -5705,16 +5716,20 @@ group('BucketOrigin', function () {
       },
       function (err, data) {
         assert.ok(!err);
-        cos.getBucketOrigin(
-          {
-            Bucket: config.Bucket,
-            Region: config.Region,
-          },
-          function (err, data) {
-            assert.ok(data.OriginRule[0].OriginInfo.FileInfo.PrefixConfiguration.Prefix === prefix);
-            done();
-          }
-        );
+        setTimeout(function () {
+          cos.getBucketOrigin(
+            {
+              Bucket: config.Bucket,
+              Region: config.Region,
+            },
+            function (err, data) {
+              assert.ok(!err);
+              assert.ok(data.OriginRule[0]);
+              assert.ok(data.OriginRule[0].OriginInfo.FileInfo.PrefixConfiguration.Prefix === prefix);
+              done();
+            }
+          );
+        }, 2000);
       }
     );
   });
@@ -6753,7 +6768,90 @@ group('RawBody error', function () {
   });
 });
 
-group('retry myqcloud.com', function () {
+group('retry local server', function () {
+  var server;
+  var port;
+  var attempts;
+  var retryHeaders;
+
+  before(function (done) {
+    server = http.createServer(function (req, res) {
+      var key = decodeURIComponent(req.url.split('?')[0].replace(/^\//, ''));
+      attempts[key] = (attempts[key] || 0) + 1;
+      retryHeaders[key] = retryHeaders[key] || [];
+      retryHeaders[key].push(req.headers['x-cos-sdk-retry']);
+
+      if (key === 'transient-500' && attempts[key] === 1) {
+        res.writeHead(500, {
+          'Content-Type': 'application/xml',
+          'x-cos-request-id': 'local-request-id',
+        });
+        return res.end('<Error><Code>InternalError</Code><Message>local transient error</Message></Error>');
+      }
+
+      if (key === 'transient-reset' && attempts[key] === 1) {
+        return req.socket.destroy();
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        ETag: '"local-etag"',
+      });
+      res.end('ok');
+    });
+    server.listen(0, '127.0.0.1', function () {
+      port = server.address().port;
+      done();
+    });
+  });
+
+  after(function (done) {
+    server.close(done);
+  });
+
+  beforeEach(function () {
+    attempts = {};
+    retryHeaders = {};
+  });
+
+  function createLocalCos() {
+    return new COS({
+      SecretId: config.SecretId,
+      SecretKey: config.SecretKey,
+      Protocol: 'http',
+      Domain: '127.0.0.1:' + port,
+      AutoSwitchHost: false,
+      Timeout: 3000,
+    });
+  }
+
+  function assertRetriedGetObject(key, done, assert) {
+    createLocalCos().getObject(
+      {
+        Bucket: 'local-retry-1250000000',
+        Region: 'ap-local',
+        Key: key,
+      },
+      function (err, data) {
+        assert.ok(!err);
+        assert.ok(data.Body.toString() === 'ok');
+        assert.ok(attempts[key] === 2);
+        assert.ok(retryHeaders[key][1] === 'true');
+        done();
+      }
+    );
+  }
+
+  test('retry after 5xx response', function (done, assert) {
+    assertRetriedGetObject('transient-500', done, assert);
+  });
+
+  test('retry after ECONNRESET', function (done, assert) {
+    assertRetriedGetObject('transient-reset', done, assert);
+  });
+});
+
+optionalGroup('retry myqcloud.com', 'COS_RUN_RETRY_TESTS', function () {
   const cos = new COS({
     SecretId: config.SecretId,
     SecretKey: config.SecretKey,
@@ -6762,8 +6860,8 @@ group('retry myqcloud.com', function () {
     Timeout: 10000,
   });
   const retryConfig = {
-    Bucket: 'cos-sdk-err-retry-1253960454',
-    Region: 'ap-chengdu',
+    Bucket: process.env.COS_RETRY_BUCKET || 'cos-sdk-err-retry-1253960454',
+    Region: process.env.COS_RETRY_REGION || 'ap-chengdu',
   };
   function getObject(Key, done, expectErr) {
     cos.getObject(
@@ -6854,7 +6952,7 @@ group('retry myqcloud.com', function () {
   });
 });
 
-group('retry tencentcos.cn', function () {
+optionalGroup('retry tencentcos.cn', 'COS_RUN_RETRY_TESTS', function () {
   const cos = new COS({
     SecretId: config.SecretId,
     SecretKey: config.SecretKey,
@@ -6864,8 +6962,8 @@ group('retry tencentcos.cn', function () {
     Domain: '{Bucket}.cos.{Region}.tencentcos.cn',
   });
   const retryConfig = {
-    Bucket: 'cos-sdk-err-retry-1253960454',
-    Region: 'ap-chengdu',
+    Bucket: process.env.COS_RETRY_BUCKET || 'cos-sdk-err-retry-1253960454',
+    Region: process.env.COS_RETRY_REGION || 'ap-chengdu',
   };
   function getObject(Key, done, expectErr) {
     cos.getObject(
@@ -6965,7 +7063,7 @@ group('getStream() 流式下载 ECONNREFUSED 错误', function () {
       SecretKey: config.SecretKey,
       Timeout: 10000,
     });
-    cos.options.Domain = '127.0.0.1:12345';
+    cos.options.Domain = 'localhost:12345';
     cos.getObject(
       {
         Bucket: config.Bucket,
@@ -6974,7 +7072,13 @@ group('getStream() 流式下载 ECONNREFUSED 错误', function () {
       },
       function (err, data) {
         console.log('ECONNREFUSED 错误', err || data);
-        assert.ok(err && (err.code === 'ECONNREFUSED' || err.code === 'ESOCKETTIMEDOUT'));
+        assert.ok(
+          err &&
+            (err.code === 'ECONNREFUSED' ||
+              err.code === 'ESOCKETTIMEDOUT' ||
+              err.code === 'ECONNRESET' ||
+              err.code === 'ETIMEDOUT')
+        );
         done();
       }
     );

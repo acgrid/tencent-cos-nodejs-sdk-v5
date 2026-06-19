@@ -6,3 +6,8 @@ demo/
 test/
 .prettierrc
 CHANGELOG.md
+.env
+*.log
+1.txt
+*mb.zip
+test.png

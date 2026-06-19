@@ -538,14 +538,11 @@ var apiWrapper = function (apiName, apiFn) {
         }
         // 兼容不带 AppId 的 Bucket
         if (params.Bucket) {
-          if (!/^([a-z\d-]+)-(\d+)$/.test(params.Bucket)) {
-            if (params.AppId) {
-              params.Bucket = params.Bucket + '-' + params.AppId;
-            } else if (self.options.AppId) {
-              params.Bucket = params.Bucket + '-' + self.options.AppId;
-            } else {
-              return 'Bucket should format as "test-1250000000".';
-            }
+          var appId = params.AppId || self.options.AppId;
+          if (appId && params.Bucket.substr(params.Bucket.length - appId.length - 1) !== '-' + appId) {
+            params.Bucket = params.Bucket + '-' + appId;
+          } else if (!/^([a-z\d-]+)-(\d+)$/.test(params.Bucket)) {
+            return 'Bucket should format as "test-1250000000".';
           }
           if (params.AppId) {
             console.warn(

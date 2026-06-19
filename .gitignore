@@ -8,3 +8,8 @@ test/*.zip
 coverage
 mocha.xml
 .nyc_output
+*.log
+1.txt
+*mb.zip
+test.png
+.env
